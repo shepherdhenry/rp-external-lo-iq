@@ -186,7 +186,10 @@ Derek 的锁腔只用了一路输出所以没发现。`adc_enc_p_o/n_o` 两个�
 
 ## 上板
 
-1. 用 Derek 的 PYNQ 镜像启动 RP。
+编译好的 `iq_demod.bit` + `iq_demod.hwh`（含 DAC 时钟修正和监视寄存器）在 GitHub Releases 里：
+https://github.com/shepherdhenry/rp-external-lo-iq/releases ，不装 Vivado 也能直接用。
+
+1. 用 PYNQ 镜像启动 RP（见上面"SD 卡与镜像"）。
 2. `scp vivado/output/iq_demod.bit vivado/output/iq_demod.hwh pynq/*.py xilinx@rp-f0f9ad.local:~/iq/`
 3. 按 `pynq/bringup.py` 开头的顺序做：`load` → `adc`（DAC 刻度/符号）→ `ch2`/`ch1`（NCO+混频+滤波）→
    `iq`（功分器，XY 模式 phasor 静止）→ `offset`（扣串扰）→ `magphase`。

@@ -1,0 +1,17 @@
+# generated / build artifacts (regenerate with model/gen_vectors.py, hls/run_hls.tcl, vivado/build.tcl)
+hls/tb_data/
+hls/iq_demod_prj/
+hls/iq_demod_ip.zip
+hls/vitis_hls.log
+hls/*.log
+vivado/output/
+vivado/*.log
+vivado/*.jou
+model/plots/
+__pycache__/
+*.pyc
+# local notes and tutorials not part of the release
+TUTORIAL.md
+RP_IQ_demod_extLO_handoff.md
+RedPitayaWifiDongle.sh
+RedPitayaWifiInstructions

@@ -51,13 +51,12 @@ w.show()
 
 
 def autostart():
-    w._connect()
-    if w.be is None:
-        return
+    """Runs once the worker thread has connected (Window.connected)."""
     w.win.setCurrentIndex(int(np.argmin([abs(w.win.itemData(k) - WIN) for k in range(w.win.count())])))
     w._apply()
     w._toggle()          # Start
 
 
-QtCore.QTimer.singleShot(300, autostart)
+w.connected.connect(autostart)
+QtCore.QTimer.singleShot(300, w._connect)
 app.exec_()

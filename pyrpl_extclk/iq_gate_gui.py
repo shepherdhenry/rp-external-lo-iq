@@ -14,6 +14,9 @@ edge; only the part inside the gate (rising -> falling edge) is shown. If the ga
 than the window, the whole window is shown and the status says so. Gates must be at least
 (window + ~0.3 s) apart, because the trace is read back over the network between gates.
 
+All Red Pitaya I/O runs in a worker thread (Worker), so the window stays responsive while
+traces are read back over the network; the GUI thread only draws.
+
 IN2 limits (Gen 2 PRO): LV +-1 V full scale (abs. max +-6 V DC, only +-1 V above 1 kHz),
 HV +-20 V (abs. max +-30 V). Use HV for TTL gates. Set "IN2 range" to match the jumper.
 
@@ -42,14 +45,28 @@ def _connect_with_key(self, hostname, *args, **kw):
 
 paramiko.SSHClient.connect = _connect_with_key
 
+from qtpy import QtCore, QtGui, QtWidgets     # noqa: E402
+
+# high-DPI scaling has to be set before the QApplication exists (importing pyrpl creates one)
+if QtWidgets.QApplication.instance() is None:
+    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
+    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
+    try:
+        QtGui.QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
+            QtCore.Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+    except (AttributeError, TypeError):
+        pass
+
 from pyrpl import Pyrpl                       # noqa: E402
-from qtpy import QtCore, QtWidgets            # noqa: E402
 import pyqtgraph as pg                        # noqa: E402
 
 F_EXACT = 687194768 * 125e6 / 2**32           # 20 000 000.0186 Hz (exact with the external clock)
 TS_OFFSET = 40                                # scope trigger timestamp lags the trig edge by ~40 cycles
 CLK = 125e6
 SAVE_DIR = os.path.join(_here, "iq_gate_data")
+
+BLUE, ORANGE, INK, MUTED = "#2a78d6", "#eb6834", "#2b2a28", "#6b6964"
+GREEN, RED, AMBER = "#1f9d55", "#d64545", "#d99a1e"
 
 
 class Backend:
@@ -123,7 +140,166 @@ class Backend:
         return t, I, Q, gate
 
 
+class Worker(QtCore.QObject):
+    """Owns the Backend and does all Red Pitaya I/O in its own thread. One acquisition step per
+    timer tick; requests from the GUI arrive as queued signals between ticks."""
+    connected = QtCore.Signal(object)         # dict(backend, bandwidths, durations)
+    failed = QtCore.Signal(str)
+    applied = QtCore.Signal(object)           # settings read back from the FPGA
+    data = QtCore.Signal(object)              # (t, I, Q, gate, trig)
+    status = QtCore.Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.be = None
+        self.state = "idle"
+        self.trig = True
+        self.thr, self.hyst, self.scale = 1.5, 0.2, 20.0
+        self.n_acq = 0
+        self.t_status = 0.0
+        self.timer = QtCore.QTimer(self)
+        self.timer.setInterval(5)
+        self.timer.timeout.connect(self._tick)
+
+    def _status(self, txt, throttle=False):
+        """Repeated 'waiting ...' messages are sent at most 5 times per second."""
+        now = time.time()
+        if throttle and now - self.t_status < 0.2:
+            return
+        self.t_status = now
+        self.status.emit(txt)
+
+    @QtCore.Slot(str)
+    def connect_rp(self, host):
+        self.timer.stop()
+        self.state = "idle"
+        try:
+            self.be = Backend(host)
+            self.connected.emit(dict(backend=self.be, bandwidths=self.be.bandwidths(),
+                                     durations=self.be.durations()))
+        except Exception as e:                        # noqa: BLE001
+            self.be = None
+            self.failed.emit(str(e))
+
+    @QtCore.Slot(object)
+    def apply(self, c):
+        if self.be is None:
+            return
+        be = self.be
+        try:
+            be.configure(c["f"], c["bw"], c["qf"], c["phase"], c["dac"])
+            window = be.set_window(c["window"])
+            be.setup_trigger(c["thr"] / c["scale"], c["hyst"] / c["scale"])
+            iq = be.iq
+            meta = dict(f_demod=iq.frequency, bandwidth=iq.bandwidth[0],
+                        quadrature_factor=iq.quadrature_factor, phase_offset=iq.phase,
+                        window=window)
+        except Exception as e:                        # noqa: BLE001
+            self._status(f"apply failed: {e}")
+            return
+        self.thr, self.hyst, self.scale = c["thr"], c["hyst"], c["scale"]
+        self.applied.emit(meta)
+        if self.state != "idle":
+            self.state = "rearm"
+
+    @QtCore.Slot(bool)
+    def start(self, trig):
+        if self.be is None:
+            return
+        self.trig = trig
+        self.state = "rearm"
+        self.timer.start()
+
+    @QtCore.Slot()
+    def stop(self):
+        self.timer.stop()
+        self.state = "idle"
+
+    @QtCore.Slot(bool)
+    def set_mode(self, trig):
+        self.trig = trig
+        if self.state != "idle":
+            self.state = "rearm"
+
+    @QtCore.Slot()          # decorated, or PyQt runs it in the thread that created the Worker
+    def _tick(self):
+        try:
+            self._step()
+        except Exception as e:                        # noqa: BLE001
+            self._status(f"error: {e} (network?) - retrying")
+            self.state = "rearm"
+            self.timer.stop()
+            QtCore.QTimer.singleShot(200, self._resume)
+
+    @QtCore.Slot()
+    def _resume(self):
+        if self.state != "idle":
+            self.timer.start()
+
+    def _step(self):
+        be, trig = self.be, self.trig
+        if self.state == "rearm":
+            if trig:
+                v = be.in2() * self.scale
+                if v > self.thr - self.hyst:
+                    self._status(f"waiting for IN2 to go low (IN2 = {v:.2f} V) ...", throttle=True)
+                    return
+            be.arm(trig)
+            self.state = "armed"
+            if trig:
+                self._status(f"armed, waiting for gate on IN2 ...  (acquisitions: {self.n_acq})")
+            return
+        if self.state == "armed":
+            if trig:
+                be.poll_edge()
+            if not be.ready():
+                return
+            t, I, Q, gate = be.read(trig)
+            self.n_acq += 1
+            self.data.emit((t, I, Q, gate, trig))
+            self.state = "rearm"
+
+
+QSS = f"""
+#root, #panel {{ background: #f4f3f0; }}
+QWidget {{ font-family: "Segoe UI"; font-size: 10pt; color: {INK}; }}
+QScrollArea {{ border: none; background: transparent; }}
+QGroupBox {{ background: #ffffff; border: 1px solid #e2e0db; border-radius: 8px;
+             margin-top: 12px; padding: 8px 10px 6px 10px; }}
+QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px;
+                    color: {MUTED}; font-weight: 600; }}
+QLineEdit, QDoubleSpinBox, QSpinBox, QComboBox {{
+    background: #ffffff; border: 1px solid #d6d3cc; border-radius: 5px;
+    padding: 2px 6px; min-height: 20px; }}
+QLineEdit:focus, QDoubleSpinBox:focus, QSpinBox:focus, QComboBox:focus {{ border-color: {BLUE}; }}
+QPushButton {{ background: #ffffff; border: 1px solid #d6d3cc; border-radius: 6px;
+               padding: 4px 12px; min-height: 20px; }}
+QPushButton:hover {{ background: #f0efeb; }}
+QPushButton:disabled {{ color: #a9a7a1; background: #f4f3f0; border-color: #e2e0db; }}
+QPushButton:checked {{ background: {BLUE}; color: #ffffff; border-color: {BLUE}; }}
+QPushButton#seg_left {{ border-top-right-radius: 0; border-bottom-right-radius: 0; }}
+QPushButton#seg_right {{ border-top-left-radius: 0; border-bottom-left-radius: 0; border-left: none; }}
+QPushButton#run {{ background: {GREEN}; color: #ffffff; border: none; font-size: 12pt;
+                   font-weight: 600; min-height: 38px; }}
+QPushButton#run:hover {{ background: #188a4a; }}
+QPushButton#run[running="true"] {{ background: {RED}; }}
+QPushButton#run[running="true"]:hover {{ background: #bf3a3a; }}
+QPushButton#run:disabled {{ background: #cfe6d8; color: #ffffff; }}
+QLabel#chip {{ background: #ffffff; border: 1px solid #e2e0db; border-radius: 8px;
+               padding: 6px 12px; }}
+QLabel#chip[alert="true"] {{ background: #fdecec; border-color: {RED}; }}
+QLabel#status {{ color: {MUTED}; font-size: 9pt; }}
+"""
+
+
 class Window(QtWidgets.QWidget):
+    connected = QtCore.Signal()               # emitted once the RP is connected and configured
+    _req_connect = QtCore.Signal(str)
+    _req_apply = QtCore.Signal(object)
+    _req_start = QtCore.Signal(bool)
+    _req_stop = QtCore.Signal()
+    _req_mode = QtCore.Signal(bool)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Red Pitaya IQ gate viewer")
@@ -131,123 +307,246 @@ class Window(QtWidgets.QWidget):
         self.state = "idle"
         self.last = None
         self.n_acq = 0
+        self.window = 0.0336
+        self.meta = {}
+        self.t_last, self.rate = None, np.nan
         self._build()
-        self.timer = QtCore.QTimer(self)
-        self.timer.timeout.connect(self._tick)
+
+        self.worker = Worker()
+        self.io_thread = QtCore.QThread()
+        self.worker.moveToThread(self.io_thread)
+        self._req_connect.connect(self.worker.connect_rp)
+        self._req_apply.connect(self.worker.apply)
+        self._req_start.connect(self.worker.start)
+        self._req_stop.connect(self.worker.stop)
+        self._req_mode.connect(self.worker.set_mode)
+        self.worker.connected.connect(self._on_connected)
+        self.worker.failed.connect(self._on_failed)
+        self.worker.applied.connect(self._on_applied)
+        self.worker.data.connect(self._on_data)
+        self.worker.status.connect(self._on_status)
+        self.io_thread.start()
 
     # ---------------- UI ----------------
     def _build(self):
-        pg.setConfigOptions(antialias=True, background="#fcfcfb", foreground="#52514e")
-        form = QtWidgets.QFormLayout()
+        QtWidgets.QApplication.instance().setStyle("Fusion")
+        self.setObjectName("root")
+        self.setAttribute(QtCore.Qt.WA_StyledBackground, True)
+        self.setStyleSheet(QSS)
+        pg.setConfigOptions(antialias=False, background="#ffffff", foreground="#52514e")
+
+        panel = QtWidgets.QWidget(objectName="panel")
+        pl = QtWidgets.QVBoxLayout(panel)
+        pl.setContentsMargins(12, 10, 12, 12)
+        pl.setSpacing(6)
+
+        def group(title):
+            gb = QtWidgets.QGroupBox(title)
+            f = QtWidgets.QFormLayout(gb)
+            f.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+            f.setLabelAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+            f.setHorizontalSpacing(12)
+            f.setVerticalSpacing(5)
+            pl.addWidget(gb)
+            return f
+
+        def row(*widgets, spacing=6):
+            h = QtWidgets.QHBoxLayout()
+            h.setSpacing(spacing)
+            for w_ in widgets:
+                h.addWidget(w_)
+            return h
+
+        # connection
+        f = group("Connection")
         self.host = QtWidgets.QLineEdit("192.168.1.186")
         self.btn_connect = QtWidgets.QPushButton("Connect")
         self.btn_connect.clicked.connect(self._connect)
-        hb = QtWidgets.QHBoxLayout()
-        hb.addWidget(self.host)
-        hb.addWidget(self.btn_connect)
-        form.addRow("Host", hb)
+        f.addRow("Host", row(self.host, self.btn_connect))
+        self.conn = QtWidgets.QLabel()
+        f.addRow(self.conn)
+        self._set_conn("off", "not connected")
 
-        self.mode_trig = QtWidgets.QRadioButton("Trigger (IN2 gate)")
-        self.mode_cont = QtWidgets.QRadioButton("Continuous")
+        # acquisition
+        f = group("Acquisition")
+        self.mode_trig = QtWidgets.QPushButton("Trigger (IN2)", objectName="seg_left", checkable=True)
+        self.mode_cont = QtWidgets.QPushButton("Continuous", objectName="seg_right", checkable=True)
+        self.mode_group = QtWidgets.QButtonGroup(self)
+        self.mode_group.setExclusive(True)
+        for b in (self.mode_trig, self.mode_cont):
+            self.mode_group.addButton(b)
         self.mode_trig.setChecked(True)
-        mb = QtWidgets.QHBoxLayout()
-        mb.addWidget(self.mode_trig)
-        mb.addWidget(self.mode_cont)
-        form.addRow("Mode", mb)
+        self.mode_trig.toggled.connect(self._mode_changed)
+        f.addRow("Mode", row(self.mode_trig, self.mode_cont, spacing=0))
+        self.win = QtWidgets.QComboBox()
+        f.addRow("Window", self.win)
 
+        # demodulation
+        f = group("Demodulation")
         self.f = QtWidgets.QDoubleSpinBox(decimals=4, maximum=62.5e6, singleStep=1.0)
         self.f.setValue(F_EXACT)
-        form.addRow("f_demod (Hz)", self.f)
+        self.f.setSuffix(" Hz")
+        f.addRow("f_demod", self.f)
         self.bw = QtWidgets.QComboBox()
-        form.addRow("IQ low-pass (Hz)", self.bw)
+        f.addRow("IQ low-pass", self.bw)
         self.qf = QtWidgets.QDoubleSpinBox(decimals=1, minimum=0.1, maximum=10000, value=1.5)
-        form.addRow("quadrature_factor", self.qf)
+        f.addRow("Quadrature factor", self.qf)
         self.phase = QtWidgets.QDoubleSpinBox(decimals=1, minimum=-180, maximum=180)
-        form.addRow("phase offset (deg)", self.phase)
-        self.win = QtWidgets.QComboBox()
-        form.addRow("window", self.win)
+        self.phase.setSuffix(" deg")
+        f.addRow("Phase offset", self.phase)
         self.dac = QtWidgets.QCheckBox("I -> OUT1, Q -> OUT2")
         self.dac.setChecked(True)
-        form.addRow("DAC", self.dac)
+        f.addRow("DAC", self.dac)
 
+        # trigger
+        f = group("Trigger (IN2)")
         self.in2range = QtWidgets.QComboBox()
         self.in2range.addItems(["HV (+-20 V)", "LV (+-1 V)"])
-        form.addRow("IN2 range (jumper)", self.in2range)
+        f.addRow("Range (jumper)", self.in2range)
         self.thr = QtWidgets.QDoubleSpinBox(decimals=2, minimum=-19, maximum=19, value=1.5)
-        form.addRow("gate threshold (V)", self.thr)
+        self.thr.setSuffix(" V")
+        f.addRow("Threshold", self.thr)
         self.hyst = QtWidgets.QDoubleSpinBox(decimals=2, minimum=0.0, maximum=5, value=0.2)
-        form.addRow("hysteresis (V)", self.hyst)
+        self.hyst.setSuffix(" V")
+        f.addRow("Hysteresis", self.hyst)
 
-        self.detrend = QtWidgets.QCheckBox("remove mean frequency from phase")
-        form.addRow("", self.detrend)
+        # display
+        f = group("Display")
         self.yfs = QtWidgets.QSpinBox(minimum=100, maximum=2000, singleStep=100, value=1000)
         self.yfs.setSuffix(" mV")
-        self.yfs.setToolTip("fixed range: I, Q in +-value, |A| in 0..1.5 x value; grid 100 mV")
-        self.btn_yrange = QtWidgets.QPushButton("Y range: fixed")
-        self.btn_yrange.setCheckable(True)
+        self.yfs.setToolTip("fixed range: I, Q in +-value, |A| in 0..1.5 x value")
+        self.btn_yrange = QtWidgets.QPushButton("Fixed", checkable=True)
         self.btn_yrange.setChecked(True)
+        self.btn_yrange.setToolTip("fixed Y range or autoscale")
         self.btn_yrange.toggled.connect(self._set_yrange)
         self.yfs.valueChanged.connect(lambda _: self._set_yrange(self.btn_yrange.isChecked()))
-        yb = QtWidgets.QHBoxLayout()
-        yb.addWidget(self.yfs)
-        yb.addWidget(self.btn_yrange)
-        form.addRow("I, Q, |A| range", yb)
+        f.addRow("Y range", row(self.yfs, self.btn_yrange))
+        self.detrend = QtWidgets.QCheckBox("Remove mean frequency from phase")
+        f.addRow(self.detrend)
+
+        # actions
+        pl.addSpacing(4)
         self.btn_apply = QtWidgets.QPushButton("Apply settings")
-        self.btn_run = QtWidgets.QPushButton("Start")
+        self.btn_run = QtWidgets.QPushButton("Start", objectName="run")
         self.btn_save = QtWidgets.QPushButton("Save last trace")
         for b in (self.btn_apply, self.btn_run, self.btn_save):
             b.setEnabled(False)
         self.btn_apply.clicked.connect(self._apply)
         self.btn_run.clicked.connect(self._toggle)
         self.btn_save.clicked.connect(self._save)
-        form.addRow(self.btn_apply)
-        form.addRow(self.btn_run)
-        form.addRow(self.btn_save)
-        self.status = QtWidgets.QLabel("not connected")
+        pl.addWidget(self.btn_run)
+        pl.addLayout(row(self.btn_apply, self.btn_save))
+        self.status = QtWidgets.QLabel("", objectName="status")
         self.status.setWordWrap(True)
-        self.status.setMinimumWidth(300)
-        form.addRow(self.status)
+        self.status.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        pl.addStretch(1)
 
-        left = QtWidgets.QWidget()
-        left.setLayout(form)
-        left.setMaximumWidth(380)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidget(panel)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        scroll.setFixedWidth(max(panel.sizeHint().width(), 360) + 16)
 
+        # readouts
+        self.chips = {}
+        chips = QtWidgets.QHBoxLayout()
+        chips.setSpacing(8)
+        for key, cap in (("gate", "Gate"), ("amean", "|A| mean"), ("amax", "|A| max"),
+                         ("rot", "Mean rotation"), ("nacq", "Acquisitions"), ("rate", "Updates")):
+            lab = QtWidgets.QLabel(objectName="chip")
+            lab.setMinimumWidth(110)
+            chips.addWidget(lab, stretch=1)
+            self.chips[key] = (lab, cap)
+            self._set_chip(key, "-")
+
+        # plots
         self.glw = pg.GraphicsLayoutWidget()
-        self.p_amp = self.glw.addPlot(row=0, col=0, title="amplitude |I + iQ|")
-        self.p_ph = self.glw.addPlot(row=1, col=0, title="phase")
-        self.p_iq = self.glw.addPlot(row=2, col=0, title="I and Q")
-        for p, lab in ((self.p_amp, "|A| (mV, iq units)"), (self.p_ph, "phase (rad)"),
-                       (self.p_iq, "I, Q (mV, iq units)")):
+        self.glw.ci.setSpacing(4)
+        tick_font = QtGui.QFont("Segoe UI", 9)
+        self.p_amp = self.glw.addPlot(row=0, col=0)
+        self.p_ph = self.glw.addPlot(row=1, col=0)
+        self.p_iq = self.glw.addPlot(row=2, col=0)
+        for p, title, lab in ((self.p_amp, "Amplitude |I + iQ|", "|A| (mV)"),
+                              (self.p_ph, "Phase", "phase (rad)"),
+                              (self.p_iq, "I and Q", "I, Q (mV)")):
+            p.setTitle(title, size="11pt", color=INK)
             p.showGrid(x=True, y=True)
             # grid alpha 0.25; set as int since pyqtgraph 0.11 passes a float to the slider
             p.ctrl.gridAlphaSlider.setValue(int(0.25 * p.ctrl.gridAlphaSlider.maximum()))
-            p.setLabel("left", lab)
-            p.setLabel("bottom", "time since gate start (ms)")
-            p.getAxis("left").enableAutoSIPrefix(False)    # keep plain mV, no "(x0.001)"
-            p.getAxis("bottom").enableAutoSIPrefix(False)
-        self.p_ph.setXLink(self.p_amp)
-        self.p_iq.setXLink(self.p_amp)
-        self.c_amp = self.p_amp.plot(pen=pg.mkPen("#2a78d6", width=2))
-        self.c_ph = self.p_ph.plot(pen=pg.mkPen("#52514e", width=2))
+            p.setLabel("left", lab, **{"font-size": "10pt"})
+            p.setDownsampling(auto=True, mode="peak")      # draw ~1 point per pixel, keep spikes
+            p.setClipToView(True)
+            p.setMenuEnabled(False)
+            for name in ("left", "bottom"):
+                ax = p.getAxis(name)
+                ax.setStyle(tickFont=tick_font)
+                ax.enableAutoSIPrefix(False)               # keep plain mV, no "(x0.001)"
+            p.getAxis("left").setWidth(64)                 # aligns the three plots
+        for p in (self.p_amp, self.p_ph):
+            p.getAxis("bottom").setStyle(showValues=False)
+            p.setXLink(self.p_iq)
+        self.p_iq.setLabel("bottom", "time since gate start (ms)", **{"font-size": "10pt"})
+        self.c_amp = self.p_amp.plot(pen=pg.mkPen(BLUE, width=1))
+        self.c_ph = self.p_ph.plot(pen=pg.mkPen(INK, width=1))
         self.p_iq.addLegend(offset=(10, 5))
-        self.c_i = self.p_iq.plot(pen=pg.mkPen("#2a78d6", width=1.5), name="I")
-        self.c_q = self.p_iq.plot(pen=pg.mkPen("#eb6834", width=1.5), name="Q")
+        self.c_i = self.p_iq.plot(pen=pg.mkPen(BLUE, width=1), name="I")
+        self.c_q = self.p_iq.plot(pen=pg.mkPen(ORANGE, width=1), name="Q")
+
+        plots = QtWidgets.QFrame()
+        plots.setStyleSheet("QFrame { background: #ffffff; border: 1px solid #e2e0db; border-radius: 8px; }")
+        pv = QtWidgets.QVBoxLayout(plots)
+        pv.setContentsMargins(6, 6, 6, 6)
+        pv.addWidget(self.glw)
+
+        right = QtWidgets.QVBoxLayout()
+        right.setContentsMargins(0, 12, 12, 12)
+        right.setSpacing(8)
+        right.addLayout(chips)
+        right.addWidget(plots, stretch=1)
+        right.addWidget(self.status)
 
         lay = QtWidgets.QHBoxLayout(self)
-        lay.addWidget(left)
-        lay.addWidget(self.glw, stretch=1)
-        self.resize(1300, 820)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        lay.addWidget(scroll)
+        lay.addLayout(right, stretch=1)
+        for sb in self.findChildren(QtWidgets.QAbstractSpinBox):
+            # type the value or use the mouse wheel / arrow keys (styled arrows render badly)
+            sb.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+        self.resize(1440, 900)
         self._set_yrange(True)
 
+    @staticmethod
+    def _repolish(w):
+        w.style().unpolish(w)
+        w.style().polish(w)
+
+    def _set_conn(self, state, txt):
+        color = {"off": "#a9a7a1", "busy": AMBER, "ok": GREEN, "err": RED}[state]
+        self.conn.setText(f"<span style='color:{color}; font-size:12pt'>&#9679;</span>&nbsp; {txt}")
+
+    def _set_chip(self, key, value, alert=False, caption=None):
+        lab, cap = self.chips[key]
+        lab.setText(f"<span style='color:{RED if alert else MUTED}; font-size:9pt'>{caption or cap}</span><br>"
+                    f"<span style='font-size:14pt; font-weight:600'>{value}</span>")
+        if lab.property("alert") != alert:
+            lab.setProperty("alert", alert)
+            self._repolish(lab)
+
+    def _set_running(self, running):
+        self.btn_run.setText("Stop" if running else "Start")
+        self.btn_run.setProperty("running", running)
+        self._repolish(self.btn_run)
+
     def _set_yrange(self, fixed):
-        """Fixed: I, Q in +-yfs mV and |A| in 0..1.5*yfs mV with a 100 mV grid; else autoscale."""
-        self.btn_yrange.setText("Y range: fixed" if fixed else "Y range: auto")
+        """Fixed: I, Q in +-yfs mV and |A| in 0..1.5*yfs mV; else autoscale."""
+        self.btn_yrange.setText("Fixed" if fixed else "Auto")
         fs = self.yfs.value()
         for p, lo, hi in ((self.p_iq, -fs, fs), (self.p_amp, 0, 1.5 * fs)):
             ax = p.getAxis("left")
             if fixed:
                 p.enableAutoRange(axis="y", enable=False)
-                p.setYRange(lo, hi, padding=0)
+                p.setYRange(lo, hi, padding=0.03)    # small margin so the end tick labels are not cut
                 major = 500 if fs >= 1000 else 100
                 ax.setTickSpacing(major=major, minor=100)
             else:
@@ -256,31 +555,42 @@ class Window(QtWidgets.QWidget):
 
     def _say(self, txt):
         self.status.setText(txt)
-        QtWidgets.QApplication.processEvents()
 
     # ---------------- actions ----------------
     def _connect(self):
-        self.timer.stop()
+        host = self.host.text().strip()
+        self._req_stop.emit()
         self.state = "idle"
-        self._say(f"connecting to {self.host.text()} (re-flashes the FPGA, ~20 s) ...")
-        try:
-            self.be = Backend(self.host.text().strip())
-        except Exception as e:                        # noqa: BLE001
-            self._say(f"connect failed: {e}")
-            return
-        self.bw.clear()
-        for b in self.be.bandwidths():
-            self.bw.addItem(f"{b:,.0f}", b)
-        self.bw.setCurrentIndex(int(np.argmin([abs(self.bw.itemData(i) - 1e5)
-                                               for i in range(self.bw.count())])))
-        self.win.clear()
-        for d in self.be.durations():
-            self.win.addItem(f"{d*1e3:.3f} ms  (dt {d/16384*1e6:.2f} us)", d)
-        self.win.setCurrentIndex(int(np.argmin([abs(self.win.itemData(i) - 0.0336)
-                                                for i in range(self.win.count())])))
-        for b in (self.btn_apply, self.btn_run, self.btn_save):
+        self._set_running(False)
+        for b in (self.btn_connect, self.btn_apply, self.btn_run, self.btn_save):
+            b.setEnabled(False)
+        self._set_conn("busy", f"connecting to {host} ...")
+        self._say("connecting (re-flashes the FPGA, ~20 s) ...")
+        self._req_connect.emit(host)
+
+    def _on_connected(self, info):
+        self.be = info["backend"]
+        for combo, items, target, fmt in (
+                (self.bw, info["bandwidths"], 1e5, lambda b: f"{b:,.0f} Hz"),
+                (self.win, info["durations"], 0.0336,
+                 lambda d: f"{d*1e3:.3f} ms  (dt {d/16384*1e6:.2f} us)")):
+            combo.blockSignals(True)
+            combo.clear()
+            for v in items:
+                combo.addItem(fmt(v), v)
+            combo.setCurrentIndex(int(np.argmin([abs(v - target) for v in items])))
+            combo.blockSignals(False)
+        for b in (self.btn_connect, self.btn_apply, self.btn_run, self.btn_save):
             b.setEnabled(True)
+        self._set_conn("ok", f"connected to {self.host.text().strip()}")
         self._apply()
+        self.connected.emit()
+
+    def _on_failed(self, msg):
+        self.be = None
+        self.btn_connect.setEnabled(True)
+        self._set_conn("err", "not connected")
+        self._say(f"connect failed: {msg}")
 
     def _scale(self):
         return 20.0 if self.in2range.currentIndex() == 0 else 1.0
@@ -288,67 +598,46 @@ class Window(QtWidgets.QWidget):
     def _apply(self):
         if self.be is None:
             return
-        try:
-            self.be.configure(self.f.value(), self.bw.currentData(), self.qf.value(),
-                              self.phase.value(), self.dac.isChecked())
-            self.window = self.be.set_window(self.win.currentData())
-            sc = self._scale()
-            thr, hy = self.thr.value() / sc, self.hyst.value() / sc
-            if abs(thr) > 0.95:
-                self._say("threshold outside the IN2 range: check 'IN2 range' / jumper")
-                return
-            self.be.setup_trigger(thr, hy)
-        except Exception as e:                        # noqa: BLE001
-            self._say(f"apply failed: {e}")
+        sc = self._scale()
+        if abs(self.thr.value() / sc) > 0.95:
+            self._say("threshold outside the IN2 range: check 'Range (jumper)'")
             return
-        bw = self.be.iq.bandwidth[0]
-        self._say(f"applied: f={self.be.iq.frequency:.4f} Hz, low-pass {bw:,.0f} Hz, "
-                  f"qf={self.be.iq.quadrature_factor:g}, window {self.window*1e3:.3f} ms")
-        if self.state != "idle":
-            self.state = "rearm"
+        self._req_apply.emit(dict(f=self.f.value(), bw=self.bw.currentData(), qf=self.qf.value(),
+                                  phase=self.phase.value(), dac=self.dac.isChecked(),
+                                  window=self.win.currentData(), thr=self.thr.value(),
+                                  hyst=self.hyst.value(), scale=sc))
+        self._say("applying settings ...")
+
+    def _on_applied(self, meta):
+        self.meta = meta
+        self.window = meta["window"]
+        self._say(f"applied: f = {meta['f_demod']:.4f} Hz, low-pass {meta['bandwidth']:,.0f} Hz, "
+                  f"qf = {meta['quadrature_factor']:g}, window {self.window*1e3:.3f} ms")
 
     def _toggle(self):
         if self.state == "idle":
-            self.state = "rearm"
-            self.btn_run.setText("Stop")
-            self.timer.start(30)
+            self.state = "running"
+            self.t_last, self.rate = None, np.nan
+            self._req_start.emit(self.mode_trig.isChecked())
+            self._set_running(True)
         else:
-            self.timer.stop()
+            self._req_stop.emit()
             self.state = "idle"
-            self.btn_run.setText("Start")
+            self._set_running(False)
             self._say("stopped")
 
-    # ---------------- acquisition state machine ----------------
-    def _tick(self):
-        try:
-            self._step()
-        except Exception as e:                        # noqa: BLE001
-            self._say(f"error: {e} (network?) - retrying")
-            self.state = "rearm"
-            time.sleep(0.2)
+    def _mode_changed(self, _):
+        if self.state != "idle":
+            self.t_last, self.rate = None, np.nan
+            self._req_mode.emit(self.mode_trig.isChecked())
 
-    def _step(self):
-        trig = self.mode_trig.isChecked()
-        if self.state == "rearm":
-            if trig:
-                v = self.be.in2() * self._scale()
-                if v > self.thr.value() - self.hyst.value():
-                    self._say(f"waiting for IN2 to go low (IN2 = {v:.2f} V) ...")
-                    return
-            self.be.arm(trig)
-            self.t_arm = time.time()
-            self.state = "armed"
-            if trig:
-                self._say(f"armed, waiting for gate on IN2 ...  (acquisitions: {self.n_acq})")
+    def _on_status(self, txt):
+        self._say(txt)
+
+    def _on_data(self, d):
+        if self.state == "idle":                      # trace that arrived after Stop
             return
-        if self.state == "armed":
-            if trig:
-                self.be.poll_edge()
-            if not self.be.ready():
-                return
-            t, I, Q, gate = self.be.read(trig)
-            self._show(t, I, Q, gate, trig)
-            self.state = "rearm"
+        self._show(*d)
 
     def _show(self, t, I, Q, gate, trig):
         self.n_acq += 1
@@ -376,12 +665,28 @@ class Window(QtWidgets.QWidget):
         self.c_i.setData(tm, I * 1e3)
         self.c_q.setData(tm, Q * 1e3)
         sat = max(np.abs(I).max(), np.abs(Q).max()) > 0.98
+
+        now = time.time()
+        if self.t_last is not None:
+            r = 1.0 / max(now - self.t_last, 1e-3)
+            self.rate = r if np.isnan(self.rate) else 0.7 * self.rate + 0.3 * r
+        self.t_last = now
+        self._set_chip("gate", "continuous" if not trig else
+                       (f">= {self.window*1e3:.1f} ms" if note else f"{gate*1e3:.3f} ms"))
+        self._set_chip("amean", f"{A.mean()*1e3:.0f} mV")
+        self._set_chip("amax", f"{A.max()*1e3:.0f} mV", alert=sat,
+                       caption="|A| max  SATURATED" if sat else None)
+        self._set_chip("rot", f"{rate:+.1f} Hz")
+        self._set_chip("nacq", f"{self.n_acq}")
+        self._set_chip("rate", "-" if np.isnan(self.rate) else f"{self.rate:.1f} /s")
+
+        m = self.meta
         self.last = dict(t=t, I=I, Q=Q, gate=gate_txt, mode="trigger" if trig else "continuous",
-                         f_demod=self.be.iq.frequency, bandwidth=self.be.iq.bandwidth[0],
-                         quadrature_factor=self.be.iq.quadrature_factor,
-                         phase_offset=self.be.iq.phase, wallclock=time.time())
-        self._say(f"#{self.n_acq}  gate: {gate_txt}   |A| mean {A.mean()*1e3:.0f} mV, max {A.max()*1e3:.0f} mV   "
-                  f"mean rotation {rate:+.1f} Hz" + ("   SATURATED: lower quadrature_factor" if sat else "")
+                         f_demod=m.get("f_demod", np.nan), bandwidth=m.get("bandwidth", np.nan),
+                         quadrature_factor=m.get("quadrature_factor", np.nan),
+                         phase_offset=m.get("phase_offset", np.nan), wallclock=now)
+        self._say(f"#{self.n_acq}  gate: {gate_txt}   |A| mean {A.mean()*1e3:.0f} mV, "
+                  f"max {A.max()*1e3:.0f} mV   rotation {rate:+.1f} Hz" + ("   SATURATED: lower the quadrature factor" if sat else "")
                   + (f"   [{note}]" if note else ""))
 
     def _save(self):
@@ -392,6 +697,12 @@ class Window(QtWidgets.QWidget):
         fn = os.path.join(SAVE_DIR, time.strftime("iq_%Y%m%d_%H%M%S.npz"))
         np.savez(fn, **self.last)
         self._say(f"saved {fn}")
+
+    def closeEvent(self, ev):
+        self._req_stop.emit()
+        self.io_thread.quit()
+        self.io_thread.wait(3000)
+        super().closeEvent(ev)
 
 
 if __name__ == "__main__":

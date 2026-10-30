@@ -15,3 +15,9 @@ TUTORIAL.md
 RP_IQ_demod_extLO_handoff.md
 RedPitayaWifiDongle.sh
 RedPitayaWifiInstructions
+# pyrpl_extclk: recorded data stays local (except example_scan/)
+pyrpl_extclk/iq_gate_data/
+# local analysis and clock tests
+th_iq/
+clock_check/
+RP_Gen2Pro_WiFi_ExtClock.md

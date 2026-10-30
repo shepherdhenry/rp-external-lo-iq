@@ -14,6 +14,9 @@ Included:
 - `hls/` — the HLS C++ source, testbench, Tcl build script and a cosim comparison tool.
 - `vivado/` — a Vivado 2023.1 script that builds the complete block design and bitstream.
 - `pynq/` — the PYNQ driver, a bring-up script, an LO-frequency sweep tool, and an SD-card writer.
+- `pyrpl_extclk/` — the simpler route without FPGA work: stock PyRPL IQ demodulation on a Red Pitaya
+  clocked from an external 125 MHz reference, with a gated real-time GUI, WiFi-dongle setup and a
+  cavity-scan example.
 
 A prebuilt `iq_demod.bit` / `iq_demod.hwh` pair is attached to each
 [GitHub release](https://github.com/shepherdhenry/rp-external-lo-iq/releases); with it you only need the

@@ -218,7 +218,9 @@ class Window(QtWidgets.QWidget):
         self.p_iq = self.glw.addPlot(row=2, col=0, title="I and Q")
         for p, lab in ((self.p_amp, "|A| (mV, iq units)"), (self.p_ph, "phase (rad)"),
                        (self.p_iq, "I, Q (mV, iq units)")):
-            p.showGrid(x=True, y=True, alpha=0.25)
+            p.showGrid(x=True, y=True)
+            # grid alpha 0.25; set as int since pyqtgraph 0.11 passes a float to the slider
+            p.ctrl.gridAlphaSlider.setValue(int(0.25 * p.ctrl.gridAlphaSlider.maximum()))
             p.setLabel("left", lab)
             p.setLabel("bottom", "time since gate start (ms)")
             p.getAxis("left").enableAutoSIPrefix(False)    # keep plain mV, no "(x0.001)"

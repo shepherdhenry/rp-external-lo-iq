@@ -73,7 +73,8 @@ class Backend:
     """Thin wrapper around the PyRPL modules used here."""
 
     def __init__(self, host):
-        self.p = Pyrpl(config="iq_gate_gui", hostname=host, gui=False)
+        # RP OS 2.x overlay.sh always loads /opt/pyrpl/fpga.bit.bin, whatever path it is given
+        self.p = Pyrpl(config="iq_gate_gui", hostname=host, gui=False, serverbinfilename="fpga.bit.bin")
         self.rp = self.p.rp
         self.iq, self.s, self.tr = self.rp.iq2, self.rp.scope, self.rp.trig
 

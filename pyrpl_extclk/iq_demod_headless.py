@@ -42,7 +42,8 @@ paramiko.SSHClient.connect = _connect_with_key
 
 from pyrpl import Pyrpl  # noqa: E402  (after the patch)
 
-p = Pyrpl(config="iq_demod_headless", hostname=HOST, gui=False)
+# RP OS 2.x overlay.sh always loads /opt/pyrpl/fpga.bit.bin, whatever path it is given
+p = Pyrpl(config="iq_demod_headless", hostname=HOST, gui=False, serverbinfilename="fpga.bit.bin")
 rp = p.rp
 
 iq = rp.iq2   # only iq2 exposes both quadratures (iq2 = I, iq2_2 = Q)
